@@ -1,0 +1,10 @@
+{
+	"extends": "@tsconfig/node22/tsconfig.json",
+	"compilerOptions": {
+		"typeRoots": ["src/@types", "node_modules/@types"],
+		"outDir": "./dist",
+		"rootDir": "./src",
+	},
+	"include": ["**/*.ts"],
+	"exclude": ["./dist", "node_modules"]
+}
