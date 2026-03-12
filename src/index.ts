@@ -3,11 +3,15 @@ import { spawn, execSync, ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { Blob } from 'buffer';
+import dayjs from 'dayjs'
 
 config();
 
 const UPLOAD_SERVER = process.env.UPLOAD_SERVER;
 if (!UPLOAD_SERVER) throw new Error('UPLOAD_SERVER not defined');
+
+type Mode = 'detect' | 'record';
+type Encoder = 'libx265' | 'h264_v4l2m2m';
 
 interface IConfig {
   DEVICE: string;
@@ -17,7 +21,7 @@ interface IConfig {
   POST_MOTION_TIME: number;
   WARMUP_TIME: number;
   TEMP_DIR: string;
-  ENCODER: 'libx264' | 'h264_v4l2m2m'
+  ENCODER: Encoder;
 }
 
 /** 
@@ -27,8 +31,8 @@ const CONFIG: IConfig = {
   DEVICE: '/dev/video0',
   TRIGGER_PREFIX: 'trigger_',
   VIDEO_PREFIX: 'video_',
-  SCENE_THRESHOLD: '0.01',
-  POST_MOTION_TIME: 5000, // 10s Nachlauf
+  SCENE_THRESHOLD: '0.005',
+  POST_MOTION_TIME: 10000, // 10s Nachlauf
   WARMUP_TIME: 3000,       // Kamera-Einschwingzeit
   TEMP_DIR: '/dev/shm',
   ENCODER: 'h264_v4l2m2m'
@@ -48,16 +52,16 @@ const cleanup = (): void => {
     fs.readdirSync(CONFIG.TEMP_DIR)
       .filter(f => f.startsWith(CONFIG.TRIGGER_PREFIX) || f.startsWith(CONFIG.VIDEO_PREFIX))
       .forEach(f => fs.unlinkSync(path.join(CONFIG.TEMP_DIR, f)));
-  } catch {}
+  } catch { }
 };
 
-const getEncoderParams = (encoder: 'libx264' | 'h264_v4l2m2m') => {
+const getEncoderParams = (encoder: Encoder) => {
   if (encoder === 'h264_v4l2m2m') {
     // Hardware: Nutzt Bitrate (4M = gute Qualität bei 1080p)
     return ['-c:v', 'h264_v4l2m2m', '-b:v', '4M'];
   } else {
     // Software: Nutzt CRF (28 = akzeptable Qualität, CPU-lastig)
-    return ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28'];
+    return ['-c:v', 'libx265', '-preset', 'veryfast', '-crf', '26'];
   }
 };
 
@@ -65,23 +69,23 @@ const getEncoderParams = (encoder: 'libx264' | 'h264_v4l2m2m') => {
  * Startet den FFmpeg-Prozess. 
  * Im Recording-Modus wird das Video gespeichert UND Trigger-Bilder für den Timer erzeugt.
  */
-const startFFmpeg = (mode: 'detect' | 'record'): void => {
+const startFFmpeg = (mode: Mode): void => {
   if (currentProcess) {
     currentProcess.kill('SIGKILL');
     currentProcess = null;
   }
 
   sessionStartTime = Date.now();
-  const timestamp = Date.now();
+  const timestamp = dayjs(new Date()).format('YYYY_MM_DD_HH_mm_ss')
   const videoPath = path.join(__dirname, `${CONFIG.VIDEO_PREFIX}${timestamp}.mp4`);
-  
+
   // Basis-Argumente
   const args = ['-f', 'v4l2', '-input_format', 'mjpeg', '-i', CONFIG.DEVICE];
 
   if (mode === 'record') {
     // Stream 0 wird zu Video, Stream 1 zu Trigger-Bildern
     args.push(
-      '-filter_complex', `[0:v]split=2[v_rec][v_det];[v_det]fps=2,scale=320:-1,select='gt(scene,${CONFIG.SCENE_THRESHOLD})'[out_det]`,
+      '-filter_complex', `[0:v]split=2[v_rec][v_det];[v_det]fps=2,select='gt(scene,${CONFIG.SCENE_THRESHOLD})'[out_det]`,
       '-map', '[v_rec]', ...getEncoderParams(CONFIG.ENCODER), '-pix_fmt', 'yuv420p', videoPath,
       '-map', '[out_det]', '-f', 'image2', '-vsync', 'vfr', path.join(CONFIG.TEMP_DIR, `${CONFIG.TRIGGER_PREFIX}%03d.jpg`)
     );
@@ -131,7 +135,7 @@ const upload = async (filePath: string, fileName: string) => {
 fs.watch(CONFIG.TEMP_DIR, (_, filename) => {
   if (filename?.startsWith(CONFIG.TRIGGER_PREFIX) && filename.endsWith('.jpg')) {
     const fullPath = path.join(CONFIG.TEMP_DIR, filename);
-    
+
     // 1. Validierung (Warmup & Existenz)
     if (Date.now() - sessionStartTime < CONFIG.WARMUP_TIME) {
       if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
@@ -160,13 +164,13 @@ const setCameraProperties = (isManual = true, exposureValue = 157, gainValue = 0
       // 1 = Manual Mode, 3 = Aperture Priority (Auto)
       // Wir setzen Modus 1, um 'exposure_time_absolute' zu aktivieren
       execSync(`v4l2-ctl -d ${CONFIG.DEVICE} -c auto_exposure=1`);
-      
+
       // Jetzt ist die Zeit nicht mehr "inactive" und kann gesetzt werden (1 bis 5000)
       execSync(`v4l2-ctl -d ${CONFIG.DEVICE} -c exposure_time_absolute=${exposureValue}`);
-      
+
       // Da manuelle Belichtung oft dunkle Bilder liefert, kannst du 'gain' nutzen
       execSync(`v4l2-ctl -d ${CONFIG.DEVICE} -c gain=${gainValue}`);
-      
+
       console.log(`[Camera] Manuell: Belichtung=${exposureValue}, Verstärkung=${gainValue}`);
     } else {
       execSync(`v4l2-ctl -d ${CONFIG.DEVICE} -c auto_exposure=3`);
@@ -179,5 +183,5 @@ const setCameraProperties = (isManual = true, exposureValue = 157, gainValue = 0
 
 // Init
 cleanup();
-setCameraProperties(false);
+setCameraProperties(true, 10, 0);
 startFFmpeg('detect');

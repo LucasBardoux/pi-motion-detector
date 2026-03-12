@@ -13,6 +13,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "dayjs": "^1.11.20",
     "dotenv": "^17.3.1",
     "express": "^5.2.1"
   },
