@@ -9,16 +9,29 @@ config();
 const UPLOAD_SERVER = process.env.UPLOAD_SERVER;
 if (!UPLOAD_SERVER) throw new Error('UPLOAD_SERVER not defined');
 
+interface IConfig {
+  DEVICE: string;
+  TRIGGER_PREFIX: string;
+  VIDEO_PREFIX: string;
+  SCENE_THRESHOLD: string;
+  POST_MOTION_TIME: number;
+  WARMUP_TIME: number;
+  TEMP_DIR: string;
+  ENCODER: 'libx264' | 'h264_v4l2m2m'
+}
+
 /** 
  * Konfiguration 
  */
-const CONFIG = {
+const CONFIG: IConfig = {
   DEVICE: '/dev/video0',
   TRIGGER_PREFIX: 'trigger_',
   VIDEO_PREFIX: 'video_',
-  SCENE_THRESHOLD: '0.002',
-  POST_MOTION_TIME: 10000, // 10s Nachlauf
+  SCENE_THRESHOLD: '0.01',
+  POST_MOTION_TIME: 5000, // 10s Nachlauf
   WARMUP_TIME: 3000,       // Kamera-Einschwingzeit
+  TEMP_DIR: '/dev/shm',
+  ENCODER: 'h264_v4l2m2m'
 };
 
 let currentProcess: ChildProcess | null = null;
@@ -32,10 +45,20 @@ let sessionStartTime = 0;
 const cleanup = (): void => {
   try {
     execSync('pkill -9 ffmpeg || true');
-    fs.readdirSync(__dirname)
+    fs.readdirSync(CONFIG.TEMP_DIR)
       .filter(f => f.startsWith(CONFIG.TRIGGER_PREFIX) || f.startsWith(CONFIG.VIDEO_PREFIX))
-      .forEach(f => fs.unlinkSync(path.join(__dirname, f)));
+      .forEach(f => fs.unlinkSync(path.join(CONFIG.TEMP_DIR, f)));
   } catch {}
+};
+
+const getEncoderParams = (encoder: 'libx264' | 'h264_v4l2m2m') => {
+  if (encoder === 'h264_v4l2m2m') {
+    // Hardware: Nutzt Bitrate (4M = gute Qualität bei 1080p)
+    return ['-c:v', 'h264_v4l2m2m', '-b:v', '4M'];
+  } else {
+    // Software: Nutzt CRF (28 = akzeptable Qualität, CPU-lastig)
+    return ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28'];
+  }
 };
 
 /**
@@ -56,18 +79,18 @@ const startFFmpeg = (mode: 'detect' | 'record'): void => {
   const args = ['-f', 'v4l2', '-input_format', 'mjpeg', '-i', CONFIG.DEVICE];
 
   if (mode === 'record') {
-    // Hochperformantes Splitting: Stream 0 wird zu Video, Stream 1 zu Trigger-Bildern
+    // Stream 0 wird zu Video, Stream 1 zu Trigger-Bildern
     args.push(
-      '-filter_complex', `[0:v]split=2[v_rec][v_det];[v_det]fps=2,select='gt(scene,${CONFIG.SCENE_THRESHOLD})'[out_det]`,
-      '-map', '[v_rec]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-pix_fmt', 'yuv420p', videoPath,
-      '-map', '[out_det]', '-f', 'image2', '-vsync', 'vfr', path.join(__dirname, `${CONFIG.TRIGGER_PREFIX}%03d.jpg`)
+      '-filter_complex', `[0:v]split=2[v_rec][v_det];[v_det]fps=2,scale=320:-1,select='gt(scene,${CONFIG.SCENE_THRESHOLD})'[out_det]`,
+      '-map', '[v_rec]', ...getEncoderParams(CONFIG.ENCODER), '-pix_fmt', 'yuv420p', videoPath,
+      '-map', '[out_det]', '-f', 'image2', '-vsync', 'vfr', path.join(CONFIG.TEMP_DIR, `${CONFIG.TRIGGER_PREFIX}%03d.jpg`)
     );
   } else {
-    // Reiner Detektions-Modus
+    // Detektions-Modus
     args.push(
       '-vf', `fps=2,select='gt(scene,${CONFIG.SCENE_THRESHOLD})'`,
       '-f', 'image2', '-vsync', 'vfr', '-loglevel', 'error',
-      path.join(__dirname, `${CONFIG.TRIGGER_PREFIX}%03d.jpg`)
+      path.join(CONFIG.TEMP_DIR, `${CONFIG.TRIGGER_PREFIX}%03d.jpg`)
     );
   }
 
@@ -105,9 +128,9 @@ const upload = async (filePath: string, fileName: string) => {
 /**
  * Watcher-Logik
  */
-fs.watch(__dirname, (_, filename) => {
+fs.watch(CONFIG.TEMP_DIR, (_, filename) => {
   if (filename?.startsWith(CONFIG.TRIGGER_PREFIX) && filename.endsWith('.jpg')) {
-    const fullPath = path.join(__dirname, filename);
+    const fullPath = path.join(CONFIG.TEMP_DIR, filename);
     
     // 1. Validierung (Warmup & Existenz)
     if (Date.now() - sessionStartTime < CONFIG.WARMUP_TIME) {
@@ -156,5 +179,5 @@ const setCameraProperties = (isManual = true, exposureValue = 157, gainValue = 0
 
 // Init
 cleanup();
-setCameraProperties(true, 20);
+setCameraProperties(false);
 startFFmpeg('detect');
