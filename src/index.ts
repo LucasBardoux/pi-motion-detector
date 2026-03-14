@@ -1,41 +1,21 @@
-import { config } from 'dotenv';
+
 import { spawn, execSync, ChildProcess } from 'child_process';
+import { IConfig, Mode } from './types';
+import { EnvVariable, getEnvVariable } from './utils/env';
+import { Blob } from 'buffer';
 import fs from 'fs';
 import path from 'path';
-import { Blob } from 'buffer';
 import dayjs from 'dayjs'
 
-config();
-
-const UPLOAD_SERVER = process.env.UPLOAD_SERVER;
-if (!UPLOAD_SERVER) throw new Error('UPLOAD_SERVER not defined');
-
-type Mode = 'detect' | 'record';
-type Encoder = 'libx265' | 'h264_v4l2m2m';
-
-interface IConfig {
-  DEVICE: string;
-  TRIGGER_PREFIX: string;
-  VIDEO_PREFIX: string;
-  SCENE_THRESHOLD: string;
-  POST_MOTION_TIME: number;
-  WARMUP_TIME: number;
-  TEMP_DIR: string;
-  ENCODER: Encoder;
-}
-
-/** 
- * Konfiguration 
- */
 const CONFIG: IConfig = {
-  DEVICE: '/dev/video0',
+  UPLOAD_SERVER: getEnvVariable(EnvVariable.UPLOAD_SERVER),
+  DEVICE: getEnvVariable(EnvVariable.DEVICE),
   TRIGGER_PREFIX: 'trigger_',
   VIDEO_PREFIX: 'video_',
-  SCENE_THRESHOLD: '0.005',
-  POST_MOTION_TIME: 10000, // 10s Nachlauf
-  WARMUP_TIME: 3000,       // Kamera-Einschwingzeit
-  TEMP_DIR: '/dev/shm',
-  ENCODER: 'h264_v4l2m2m'
+  SCENE_THRESHOLD: getEnvVariable(EnvVariable.SCENE_THRESHOLD),
+  POST_MOTION_TIME: +getEnvVariable(EnvVariable.POST_MOTION_TIME),
+  WARMUP_TIME: +getEnvVariable(EnvVariable.WARMUP_TIME),
+  TEMP_DIR: getEnvVariable(EnvVariable.TEMP_DIR),
 };
 
 let currentProcess: ChildProcess | null = null;
@@ -43,9 +23,6 @@ let stopTimer: NodeJS.Timeout | null = null;
 let isRecording = false;
 let sessionStartTime = 0;
 
-/**
- * Bereinigt die Umgebung
- */
 const cleanup = (): void => {
   try {
     execSync('pkill -9 ffmpeg || true');
@@ -55,20 +32,6 @@ const cleanup = (): void => {
   } catch { }
 };
 
-const getEncoderParams = (encoder: Encoder) => {
-  if (encoder === 'h264_v4l2m2m') {
-    // Hardware: Nutzt Bitrate (4M = gute Qualität bei 1080p)
-    return ['-c:v', 'h264_v4l2m2m', '-b:v', '4M'];
-  } else {
-    // Software: Nutzt CRF (28 = akzeptable Qualität, CPU-lastig)
-    return ['-c:v', 'libx265', '-preset', 'veryfast', '-crf', '26'];
-  }
-};
-
-/**
- * Startet den FFmpeg-Prozess. 
- * Im Recording-Modus wird das Video gespeichert UND Trigger-Bilder für den Timer erzeugt.
- */
 const startFFmpeg = (mode: Mode): void => {
   if (currentProcess) {
     currentProcess.kill('SIGKILL');
@@ -78,31 +41,25 @@ const startFFmpeg = (mode: Mode): void => {
   sessionStartTime = Date.now();
   const timestamp = dayjs(new Date()).format('YYYY_MM_DD_HH_mm_ss')
   const videoPath = path.join(__dirname, `${CONFIG.VIDEO_PREFIX}${timestamp}.mp4`);
-
-  // Basis-Argumente
   const args = ['-f', 'v4l2', '-input_format', 'mjpeg', '-i', CONFIG.DEVICE];
 
-  if (mode === 'record') {
-    // Stream 0 wird zu Video, Stream 1 zu Trigger-Bildern
+  mode === 'record' ?
     args.push(
       '-filter_complex', `[0:v]split=2[v_rec][v_det];[v_det]fps=2,select='gt(scene,${CONFIG.SCENE_THRESHOLD})'[out_det]`,
-      '-map', '[v_rec]', ...getEncoderParams(CONFIG.ENCODER), '-pix_fmt', 'yuv420p', videoPath,
+      '-map', '[v_rec]', '-c:v', 'h264_v4l2m2m', '-b:v', '4M', '-pix_fmt', 'yuv420p', videoPath,
       '-map', '[out_det]', '-f', 'image2', '-vsync', 'vfr', path.join(CONFIG.TEMP_DIR, `${CONFIG.TRIGGER_PREFIX}%03d.jpg`)
-    );
-  } else {
-    // Detektions-Modus
+    )
+    :
     args.push(
       '-vf', `fps=2,select='gt(scene,${CONFIG.SCENE_THRESHOLD})'`,
       '-f', 'image2', '-vsync', 'vfr', '-loglevel', 'error',
       path.join(CONFIG.TEMP_DIR, `${CONFIG.TRIGGER_PREFIX}%03d.jpg`)
     );
-  }
 
   currentProcess = spawn('ffmpeg', args);
 
-  if (mode === 'record') {
+  if (mode === 'record')
     currentProcess.on('close', () => handleFinishedVideo(videoPath, `${CONFIG.VIDEO_PREFIX}${timestamp}.mp4`));
-  }
 };
 
 const handleFinishedVideo = async (filePath: string, fileName: string) => {
@@ -121,7 +78,7 @@ const upload = async (filePath: string, fileName: string) => {
     const buffer = fs.readFileSync(filePath);
     const formData = new FormData();
     formData.append('file', new Blob([buffer]), fileName);
-    const res = await fetch(UPLOAD_SERVER!, { method: 'POST', body: formData });
+    const res = await fetch(CONFIG.UPLOAD_SERVER, { method: 'POST', body: formData });
     if (res.ok) console.log(`[Upload] Erfolg: ${fileName}`);
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   } catch (err) {
@@ -129,27 +86,24 @@ const upload = async (filePath: string, fileName: string) => {
   }
 };
 
-/**
- * Watcher-Logik
- */
 fs.watch(CONFIG.TEMP_DIR, (_, filename) => {
   if (filename?.startsWith(CONFIG.TRIGGER_PREFIX) && filename.endsWith('.jpg')) {
     const fullPath = path.join(CONFIG.TEMP_DIR, filename);
 
-    // 1. Validierung (Warmup & Existenz)
+    // 1. Warmup time
     if (Date.now() - sessionStartTime < CONFIG.WARMUP_TIME) {
       if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
       return;
     }
     if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
 
-    // 2. Timer Management (Verlängerung)
+    // 2. Timer management
     if (stopTimer) clearTimeout(stopTimer);
     stopTimer = setTimeout(() => {
       if (isRecording && currentProcess?.stdin) currentProcess.stdin.write('q');
     }, CONFIG.POST_MOTION_TIME);
 
-    // 3. Status-Wechsel
+    // 3. Switch status
     if (!isRecording) {
       isRecording = true;
       console.log('[System] Bewegung detektiert - Starte Aufnahme');
@@ -161,14 +115,8 @@ fs.watch(CONFIG.TEMP_DIR, (_, filename) => {
 const setCameraProperties = (isManual = true, exposureValue = 157, gainValue = 0) => {
   try {
     if (isManual) {
-      // 1 = Manual Mode, 3 = Aperture Priority (Auto)
-      // Wir setzen Modus 1, um 'exposure_time_absolute' zu aktivieren
       execSync(`v4l2-ctl -d ${CONFIG.DEVICE} -c auto_exposure=1`);
-
-      // Jetzt ist die Zeit nicht mehr "inactive" und kann gesetzt werden (1 bis 5000)
       execSync(`v4l2-ctl -d ${CONFIG.DEVICE} -c exposure_time_absolute=${exposureValue}`);
-
-      // Da manuelle Belichtung oft dunkle Bilder liefert, kannst du 'gain' nutzen
       execSync(`v4l2-ctl -d ${CONFIG.DEVICE} -c gain=${gainValue}`);
 
       console.log(`[Camera] Manuell: Belichtung=${exposureValue}, Verstärkung=${gainValue}`);
@@ -181,7 +129,6 @@ const setCameraProperties = (isManual = true, exposureValue = 157, gainValue = 0
   }
 };
 
-// Init
 cleanup();
 setCameraProperties(true, 10, 0);
 startFFmpeg('detect');
