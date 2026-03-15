@@ -22,6 +22,7 @@ let currentProcess: ChildProcess | null = null;
 let stopTimer: NodeJS.Timeout | null = null;
 let isRecording = false;
 let sessionStartTime = 0;
+let isShippingPipelineUploading = false;
 
 const cleanup = (): void => {
   try {
@@ -66,7 +67,7 @@ const handleFinishedVideo = async (filePath: string, fileName: string) => {
   isRecording = false;
   if (fs.existsSync(filePath) && fs.statSync(filePath).size > 50000) {
     console.log(`[System] Video bereit: ${fileName}`);
-    await upload(filePath, fileName);
+    await processFiles(filePath, fileName);
   } else if (fs.existsSync(filePath)) {
     fs.unlinkSync(filePath);
   }
@@ -74,15 +75,53 @@ const handleFinishedVideo = async (filePath: string, fileName: string) => {
 };
 
 const upload = async (filePath: string, fileName: string) => {
+  const buffer = fs.readFileSync(filePath);
+  const formData = new FormData();
+  formData.append('file', new Blob([buffer]), fileName);
+  return await fetch(`${CONFIG.UPLOAD_SERVER}/upload`, { method: 'POST', body: formData });
+}
+
+const moveToShippingPipeline = (filePath: string, fileName: string) => {
+  fs.copyFileSync(filePath, path.join(getEnvVariable(EnvVariable.SHIPPING_PIPELINE_DIRECTORY), fileName));
+  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+}
+
+const uploadShippingPipeline = () => {
+  setInterval(async () => {
+    const SHIPPING_PIPELINE_DIRECTORY = getEnvVariable(EnvVariable.SHIPPING_PIPELINE_DIRECTORY)
+    if (isShippingPipelineUploading || !fs.existsSync(SHIPPING_PIPELINE_DIRECTORY)) return;
+
+    const files = fs.readdirSync(SHIPPING_PIPELINE_DIRECTORY);
+
+    if (files.length) {
+      try {
+        const res = await fetch(`${CONFIG.UPLOAD_SERVER}/health`);
+        if (res.ok) {
+          isShippingPipelineUploading = true
+          for (const fileName of files) {
+            const filePath = path.join(SHIPPING_PIPELINE_DIRECTORY, fileName);
+            const uploadRes = await upload(filePath, fileName);
+            if (uploadRes.ok && fs.existsSync(filePath))
+              fs.unlinkSync(filePath);
+          }
+        }
+      } catch {
+        console.log('[Shipping Pipeline] Server not available')
+      }
+    }
+
+    isShippingPipelineUploading = false
+  }, 10000);
+}
+
+const processFiles = async (filePath: string, fileName: string) => {
   try {
-    const buffer = fs.readFileSync(filePath);
-    const formData = new FormData();
-    formData.append('file', new Blob([buffer]), fileName);
-    const res = await fetch(CONFIG.UPLOAD_SERVER, { method: 'POST', body: formData });
+    const res = await upload(filePath, fileName)
     if (res.ok) console.log(`[Upload] Erfolg: ${fileName}`);
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   } catch (err) {
     console.error('[Upload] Fehler:', err);
+    moveToShippingPipeline(filePath, fileName);
   }
 };
 
@@ -132,3 +171,4 @@ const setCameraProperties = (isManual = true, exposureValue = 157, gainValue = 0
 cleanup();
 setCameraProperties(true, 10, 0);
 startFFmpeg('detect');
+uploadShippingPipeline()

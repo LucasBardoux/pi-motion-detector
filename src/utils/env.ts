@@ -8,6 +8,7 @@ export enum EnvVariable {
   POST_MOTION_TIME = 'POST_MOTION_TIME',
   WARMUP_TIME = 'WARMUP_TIME',
   TEMP_DIR = 'TEMP_DIR',
+  SHIPPING_PIPELINE_DIRECTORY = 'SHIPPING_PIPELINE_DIRECTORY'
 }
 
 export function getEnvVariable(name: EnvVariable): string {
